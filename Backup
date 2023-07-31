@@ -1,0 +1,583 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jun 20 15:07:57 2023
+
+@author: SCOSTA1
+"""
+
+import pandas as pd
+import numpy as np
+from asammdf import MDF
+import os
+import matplotlib.pyplot as plt
+from scipy import interpolate
+import random 
+import warnings
+
+# Lembrar que a funcao pontos unicos esta errada
+# Ela deve localizar todos os pontos que devem ser otimizados
+# Os visinhos nao estao sendo otimizados
+
+# path = 'C:/Users/scosta1/OneDrive/OneDrive - JAGUAR LAND ROVER/Desktop/'
+# path = 'C:/Users/scosta1/OneDrive/OneDrive - JAGUAR LAND ROVER/Desktop/GPF_data/2nd round tests/'
+
+# path = 'C:/ETASData/INCA7.2/Measure/P6/24MY PHEV/'
+path = 'C:/ETASData/INCA7.2/Measure/P6/24MY PHEV/'
+path = 'C:/Users/scosta1/OneDrive/OneDrive - JAGUAR LAND ROVER/Desktop/GPF_data/2nd round tests/'
+# file = '24MY P6 PHEV PYX Active GPF DCM_Service Regen etakh 0.7 tiAbort2700 tDifDes-5000 _2023-05-25_05.dat'
+# file = '24MY P6 PHEV PYX Cal24550_Service Reg_Exc redundant_Sucess in model THERMO OFFSET_2023-05-26_10.dat'
+file = '1-24MY P6 PHEV PYX Cal20230_7.0g_Service Reg_Exc_ChangedReacEnth redundant__2223-16-16_01.dat'
+# file = '24MY P6 PHEV PYX Cal20230_7.0g_07.2.1_Service Reg_Exc_ChangedReacEnth redundant__1423-16-16_01_friday_coldStart2.dat'
+
+# file = '24MY P6 PHEV PYX Cal20230_forced_regen_Soot0.9g_1st_attempt.dat'
+
+mdf = MDF(path+file)
+
+#%%---FUNCTIONS
+def thermal_model(comp_i, comp_final, cal0_str):
+    global texh0, texh1, texh2, texh3, texh4, texh5, texh6, texh7, texh8, texh9, texh10, twall0, twall1, twall2, twall3, twall4, twall5, twall6, twall7, twall8, twall9, twall10
+    poli_exp_f = 0
+    f_lam = cal_func(cal_ExhMod_facExoCorrnLamB1_M, '2d')
+    ff_vel = cal_func(cal_ExhMod_htcWallEnvExtdB1_M, '2d')
+    for comp in cal_ExhMod_stCfgExhSysB1_CAy_bkps[comp_i:comp_final]: #Maximum component ID
+        
+        c_comp = cal_ExhMod_cpAbsltPipCatB1_CA.iloc[0,comp_i] #Constant for each element
+        f_vel = ff_vel(0, comp_i) #Dyno conditions/if vehicle speed is different than 0, this equation must be different
+        if comp == 2: #catalyst
+            f_k = interpolate.interp1d(cal_ExhMod_tDeltaExoHspCatHeatgB1_Mx_bkps, 
+                                       cal_ExhMod_tDeltaExoHspCatHeatgB1_M.loc[comp_i,:], 
+                                       fill_value='extrapolate')
+        elif (comp == 1 or comp == 7):
+            f_k = interpolate.interp1d(cal_ExhMod_htcExhWallB1_Mx_bkps, cal_ExhMod_htcExhWallB1_M.loc[comp_i,:], fill_value='extrapolate')
+            if comp_i == 0:
+                f_ExhMod_tExhVlvHomB1_M = cal_func(cal_ExhMod_tExhVlvHomB1_M, '2d')
+                f_lam_vlv = cal_func(cal_ExhMod_facTExhVlvCorrnLamExtdB1_M, '2d')
+                f_ign_vlv = cal_func(cal_ExhMod_facTExhVlvCorrnIgnAgHomExtdB1_M, '2d')
+                exh_vlv_filter = cal_func(cal_ExhMod_tiConTExhVlvFcoB1_T, '1d')
+
+        if comp == 7:
+            poli_exp_f = cal_func(cal_ExhMod_ratPPolytropExpo_M, '2d')
+        for i in range(1, len(tamb)):
+            if comp_i!=0: #After Valve Gas Temp Calculation
+                globals()['twall%s' %comp_i][i], globals()['texh%s' %comp_i][i] = exhmod(
+                    comp, f_k, globals()['texh%s' %comp_i], globals()['twall%s' %comp_i], 
+                    i, ff_vel, c_comp, globals()['texh%s' %(comp_i-1)], poli_exp_f, f_lam)
+            else: #Valve Gas Temp Calculation
+                globals()['twall%s' %comp_i][i], globals()['texh%s' %comp_i][i] = exhvalve(i, f_ExhMod_tExhVlvHomB1_M, f_lam_vlv, f_ign_vlv, texh0, cal_ExhMod_cpAbsltVlvFildB1_C, twall0, f_k, c_comp, exh_vlv_filter, ff_vel)
+        comp_i = comp_i + 1  
+        
+def optimization(cal0_str, meas_data, comp_i, comp_final, modeled_str, lim):
+    global texh0, texh1, texh2, texh3, texh4, texh5, texh6, texh7, texh8, texh9, texh10, twall0, twall1, twall2, twall3, twall4, twall5, twall6, twall7, twall8, twall9, twall10
+    global count, erro_1, erro_global
+    #cal0 -> Calibration Dataframe
+    #meas_data -> List of list [x, y, z]
+    #%% SETTING INITIAL MODEL CONDITIONS AS THE THERMOCOUPLES
+    twall0[0] = meas_data[2][0]
+    texh0[0] = meas_data[2][0]
+    texh1[0] = meas_data[2][0]
+    twall1[0] = meas_data[2][0]
+    twall2[0] = meas_data[2][0]
+    globals()[modeled_str][0]=meas_data[2][0]
+    
+    #%%---OPTIMIZATION FOR 0D CALS
+    if type(globals()[cal0_str])==float or type(globals()[cal0_str])==int:
+        erro_global_0 = error(globals()[modeled_str], meas_data[2])
+        
+        new_t = globals()[cal0_str]
+        incremento = new_t*0.005
+
+        iterator = 0
+        delta_erro = 10
+
+        #%%%---OPTIMIZATION ESCALAR
+        while abs(delta_erro)>0.005:
+            new_t0 = new_t
+            new_t = new_t+1*(incremento)
+            print(delta_erro)
+            if new_t>lim[1]:
+                print('new temp out of limits')
+                break
+            elif new_t<lim[0]:
+                print('new temp out of limits')
+                break
+            
+            globals()[cal0_str] = new_t
+            
+            thermal_model(comp_i, comp_final, cal0_str)
+            
+            #CALCULATING ERROR                
+            erro_global = error(globals()[modeled_str], meas_data[2])
+            delta_erro = erro_global - erro_1
+            print(count, erro_global, erro_1, new_t)
+
+            if iterator != 0:
+                incremento = ((erro_global-erro_1)/incremento)*(-0.75)*(new_t/erro_global)
+            else:
+                incremento = ((erro_global-erro_global_0)/incremento)*(-0.75)*(new_t/erro_global)
+
+
+            if abs(erro_global) > abs(erro_1) and iterator > 0:
+                print('saida 2')
+                globals()[cal0_str] = new_t0
+                break
+            if iterator > 50:
+                print('saida 3')
+                break
+            if abs(delta_erro) < 0.00001:
+                globals()[cal0_str] = new_t0
+                print('saida erro 0')
+            if abs((new_t-new_t0)/new_t) < 0.0005:
+                print('saida otimizada')
+                break
+                
+            
+            iterator = iterator + 1
+            erro_1 = erro_global
+            count += 1
+            
+    #%%---OPTIMIZATION FOR 1D CALS        
+    elif type(meas_data[1])==int:
+        
+        
+        speed_bkps = globals()[cal0_str].copy().columns
+    
+        rd_spd = speed_bkps.copy().to_list()
+        random.shuffle(rd_spd)
+        
+        rd_spd = brkp_opt( globals()[cal0_str], meas_data[0], 0, '1d')
+        random.shuffle(rd_spd)
+
+        
+        for spd in rd_spd:
+
+                
+            erro_global_0 = error(globals()[modeled_str], meas_data[2])
+            
+            new_t = globals()[cal0_str][spd][meas_data[1]]
+            incremento = new_t*0.005
+            iterator = 0
+            delta_erro = 10
+
+    #%%%---OPTIMIZATION FOR EACH SPEED/LOAD
+            while abs(delta_erro)>0.005:
+                new_t0 = new_t
+                new_t = new_t+1*(incremento)
+                
+                if new_t>lim[1]:
+                    print('new temp out of limits')
+                    break
+                elif new_t<lim[0]:
+                    print('new temp out of limits')
+                    break
+                
+                globals()[cal0_str][spd][meas_data[1]] = new_t
+                
+                thermal_model(comp_i, comp_final, cal0_str)
+                
+                #CALCULATING ERROR                
+                erro_global = error(globals()[modeled_str], meas_data[2])
+                delta_erro = erro_global - erro_1
+                print(count, spd, erro_global, erro_1, new_t)
+
+                if iterator != 0:
+                    incremento = ((erro_global-erro_1)/incremento)*(-0.75)
+                else:
+                    incremento = ((erro_global-erro_global_0)/incremento)*(-0.75)
+
+
+                if abs(erro_global) > abs(erro_1) and iterator > 0:
+                    print('saida 2')
+                    globals()[cal0_str][spd][meas_data[1]] = new_t0
+                    break
+                if iterator > 50:
+                    print('saida 3')
+                    break
+                if abs(delta_erro) < 0.00001:
+                    globals()[cal0_str][spd][load] = new_t0
+                    print('saida erro 0')
+                if abs((new_t-new_t0)/new_t) < 0.0005:
+                    print('saida otimizada')
+                    break
+                    
+                
+                iterator = iterator + 1
+                erro_1 = erro_global
+                count += 1
+        
+    #%%---OPTIMIZATION FOR 2D CALS   
+    elif type(globals()[cal0_str])==pd.DataFrame:
+        speed_bkps = globals()[cal0_str].copy().columns
+        load_bkps = globals()[cal0_str].copy().index
+    
+        rd_spd = speed_bkps.copy().to_list()
+        random.shuffle(rd_spd)
+        rd_load = load_bkps.copy().to_list()
+        random.shuffle(rd_load)
+        
+        rd_spd = brkp_opt(globals()[cal0_str], meas_data[0], meas_data[1])
+        random.shuffle(rd_spd) #Nao consegui fazer isso ser convertido em uma lista
+
+        
+        # for spd in rd_spd:
+        #     for load in rd_load:
+        
+        for i in rd_spd:
+            spd = i[0]
+            load = i[1]
+                
+            erro_global_0 = error(globals()[modeled_str], meas_data[2])
+            
+            new_t = globals()[cal0_str][spd][load]
+            incremento = new_t*0.005
+            
+            delta_erro = 10
+
+
+            iterator = 0
+            
+            #---OPTIMIZATION FOR EACH SPEED/LOAD
+            while abs(delta_erro)>0.005:
+                new_t0 = new_t
+                new_t = new_t+1*(incremento)
+                
+                if new_t>lim[1]:
+                    print('new temp out of limits: '+str(incremento))
+                    break
+                elif new_t<lim[0]:
+                    print('new temp out of limits: '+str(incremento))
+                    break
+                
+                globals()[cal0_str][spd][load] = new_t
+                
+                thermal_model(comp_i, comp_final, cal0_str)
+                
+                #CALCULATING ERROR                
+                erro_global = error(globals()[modeled_str], meas_data[2])
+                delta_erro = erro_global - erro_1
+                
+                print(count, round(spd,2) , load, round(erro_global, 3), round(erro_1, 3) , new_t, incremento)
+
+                if iterator != 0:
+                    incremento = ((erro_global-erro_1)/incremento)*(-0.75)*(new_t/erro_global)
+                else:
+                    incremento = ((erro_global-erro_global_0)/incremento)*(-0.75)*(new_t/erro_global)
+
+
+                if abs(erro_global) > abs(erro_1) and iterator > 0:
+                    print('saida 2')
+                    globals()[cal0_str][spd][load] = new_t0
+                    break
+                if iterator > 50:
+                    # print('saida 3')
+                    break
+                if abs(delta_erro) < 0.00001:
+                    globals()[cal0_str][spd][load] = new_t0
+                    print('saida erro 0')
+                if abs((new_t-new_t0)/new_t) < 0.0005:
+                    print('saida otimizada')
+                    break
+                    
+                
+                iterator = iterator + 1
+                erro_1 = erro_global
+                count += 1
+                # print(texh2[0])
+
+                
+    return globals()[cal0_str], erro_global
+
+def brkp_opt(cal_in, x_lst, y_lst, d_check=None):       
+    x_brkps = []
+    y_brkps = []
+    for i in range(len(x_lst)):
+        x = x_lst[i]
+        if x <= cal_in.columns[0]:
+            x = cal_in.columns[0]
+        elif x >= cal_in.columns[-1]:
+            x = cal_in.columns[-1]
+        else:
+            for spd in range(len(cal_in.columns)):
+                if x >= cal_in.columns[spd] and x < cal_in.columns[spd+1]:
+                    if x >= cal_in.columns[spd]+(cal_in.columns[spd+1]-cal_in.columns[spd])/2:
+                        x = cal_in.columns[spd+1]
+                        break
+                    else:
+                        x = cal_in.columns[spd]
+                        break
+        x_brkps.append(x)
+
+        if d_check == None:        
+            y = y_lst[i]
+            if y <= cal_in.index[0]:
+                y = cal_in.index[0]
+            elif y >= cal_in.index[-1]:
+                y = cal_in.index[-1]
+            else:
+                for spd in range(len(cal_in.index)):
+                    if y >= cal_in.index[spd] and y < cal_in.index[spd+1]:
+                        if y >= cal_in.index[spd]+(cal_in.index[spd+1]-cal_in.index[spd])/2:
+                            y = cal_in.index[spd+1]
+                            break
+                        else:
+                            y = cal_in.index[spd]
+                            break
+            y_brkps.append(y)
+            
+    z  = pd.DataFrame(x_brkps, columns=['a'])   
+    if d_check == None:
+        z['b']  = y_brkps  
+        z = z.groupby(['a', 'b']).count().index.tolist()
+    else:
+        z = z['a'].unique()
+    return z
+
+def error(measured, calculated):
+    measured = np.array(measured)
+    calculated = np.array(calculated)
+    error = (measured-calculated)**2
+    
+    return error.mean()
+
+def get_vars(var):
+    y = mdf.get(var).samples.copy().tolist()
+    t = mdf.get(var).timestamps.copy().tolist()
+    return t, y
+
+def inca_interp(t, y, input_t):
+    function = interpolate.interp1d(t, y, fill_value='extrapolate')
+    return function(input_t) 
+
+def inca_interp2d(x, y, z):
+    warnings.filterwarnings("ignore")
+    function = interpolate.interp2d(x, y, z, kind='cubic')
+    return function
+
+def cal_func(dataset, dimension):
+    if dimension == '2d':
+        y = dataset.index.to_list()
+        x = dataset.columns.to_list()
+        z = dataset.iloc[0:,0:]
+        if len(x)>2 and len(y)>2:
+            function = inca_interp2d(x, y, z)
+        else:
+            function = interpolate.interp2d(x, y, z)
+    else:
+        y = dataset.iloc[0,:].to_list()
+        x = dataset.columns.to_list()        
+        function = interpolate.interp1d(x, y, fill_value='extrapolate')
+    
+    return function
+
+def exhmod(component, f_k, texh, twall, i, f_vel, c_component, texh_prev, 
+           poli_exp_f=None, f_lam=None):
+    global tamb, mfExh, ExhMod_ratPTcB1, uego, vel  
+    K = f_k(mfExh[i])
+    K = K/(1-K)
+    
+    if component == 1: #Pipe Element
+        #Calculation of new Twall7
+        Qg_w = mfExh[i]/3600*1066*K*(texh[i-1]-twall[i-1])
+        Qa_w = f_vel(vel[i], comp_i)*(twall[i-1]-tamb[i])
+        delta_t = (Qg_w - Qa_w)*(t_tamb[1]-t_tamb[0])/c_component
+        twall[i] = twall[i-1] + delta_t
+        
+        #Calculation of new Texh7
+        texh[i] = (texh_prev[i]+273.15+(twall[i]+273.15)*K)/(1+K)-273.15
+        
+        return twall[i][0], texh[i][0]
+        
+    if component == 2: #Brick Element
+        cp_exh = mfExh[i]/3600*1066
+        spk_corr = f_k(mfExh[i])*cp_exh
+        lamb_corr = f_lam(uego[i], 0) #Same values for Catalyst1 and GPF
+        exo = spk_corr*lamb_corr
+        pwr = (texh_prev[i-1]-texh[i-1])*cp_exh+f_vel(vel[i], comp_i)*(tamb[i]-texh[i-1])+exo
+        delta_t = pwr/c_component*(t_tamb[1]-t_tamb[0])
+        texh[i] = texh[i-1] + delta_t
+        
+        return texh[i][0], texh[i][0]
+    
+    if component == 7: #Turbo
+        #Input of the turbo (Pipe model)
+        Qg_w = mfExh[i]/3600*1066*K*(texh[i]-twall[i-1])
+        Qa_w = f_vel(vel[i], comp_i)*(twall[i-1]-tamb[i])
+        delta_t7 = (Qg_w - Qa_w)*(t_tamb[1]-t_tamb[0])/c_component
+        
+        texh[i] = (texh_prev[i-1]+273.15+(twall[i-1]+273.15)*K)/(1+K)-273.15
+        
+        #Output of the turbo (Pressure Ratio + Pipe model)
+        K_turbo = poli_exp_f(mfExh[i], ExhMod_ratPTcB1[i]).tolist()[0]
+        texh[i] = K_turbo*texh[i]
+        
+        Qg_w = mfExh[i]/3600*1066*K*(texh[i]-twall[i-1])
+        Qa_w = f_vel(vel[i], comp_i)*(twall[i-1]-tamb[i])
+        delta_t7 = (Qg_w - Qa_w)*(t_tamb[1]-t_tamb[0])/c_component
+        
+        twall[i] = twall[i-1] + delta_t7
+        texh[i] = (texh_prev[i]+273.15+(twall[i]+273.15)*K)/(1+K)-273.15
+        
+        return twall[i][0], texh[i][0]
+        
+def exhvalve(i, tExhVlvHomB1_M, f_lam, f_ign_vlv, texh0, cp_vlv, twall0, 
+             f_k, c_component, k_filter, f_vel):
+    global rpm, airmod, mfExh, uego, ignEff, coolant_t
+    K = f_k(mfExh[i])
+    K = K/(1-K)
+    
+    #same as the standard model
+    Qg_w = mfExh[i]/3600*1066*K*(texh0[i-1]-twall0[i-1])
+    Qa_w = f_vel(vel[i], comp_i)*(twall0[i-1]-tamb[i])
+    delta_t7 = (Qg_w - Qa_w)*(t_tamb[1]-t_tamb[0])/c_component
+    twall0[i] = twall0[i-1] + delta_t7
+    
+    #exhaust gas temperature model
+    t_base = tExhVlvHomB1_M(rpm[i], airmod[i]) #steady state temps
+    lam_corr = f_lam(uego[i], mfExh[i]) #lambda corrections
+    ign_corr = f_ign_vlv(ignEff[i], mfExh[i]) #ignition correction
+    texh = (t_base*lam_corr*ign_corr)[0] #steady state temps + corrections
+    texh = (texh+273.15+(twall0[i]+273.15)*K)/(1+K)-273.15
+    k_filter = k_filter(mfExh[i])
+    texh = (texh-texh0[i-1])*k_filter+texh0[i-1] #filtering the t exh vlv
+    
+    return twall0[i], texh[0]
+
+#%%---Loading variables
+t_rpm, rpm = get_vars('Epm_nEng')
+t_mfExh, mfExh = get_vars('ExhMod_mfExoB1')
+t_tamb, tamb = get_vars('ExhMod_tEnvCorrdTEngAryB1_[8]')
+t_ExhMod_ratPTcB1, ExhMod_ratPTcB1 = get_vars('ExhMod_ratPTcB1') #Pressure Ratio Turbocharger
+t_uego, uego = get_vars('UEGO_rLamS1B1')
+t_airmod, airmod = get_vars('AirMod_ratChrgAirCyl')
+t_ignEff, ignEff = get_vars('ExhMod_effIgnAgAvrgB1')
+t_gpf_in_t, gpf_in_t = get_vars('GPFGasIn_04TK0049')
+t_cat_in_t, cat_in_t = get_vars('CatGasInCntrFl_04TK0034')
+t_vel, vel = get_vars('VehV_v')
+
+#%%---Editing the raster of the signals
+mfExh = inca_interp(t_mfExh, mfExh, t_tamb)
+ExhMod_ratPTcB1 = inca_interp(t_ExhMod_ratPTcB1, ExhMod_ratPTcB1, t_tamb)
+uego = inca_interp(t_uego, uego, t_tamb)
+airmod = inca_interp(t_airmod, airmod, t_tamb)
+ignEff = inca_interp(t_ignEff, ignEff, t_tamb)
+rpm = inca_interp(t_rpm, rpm, t_tamb) 
+gpf_in_t = inca_interp(t_gpf_in_t, gpf_in_t, t_tamb)
+cat_in_t = inca_interp(t_cat_in_t, cat_in_t, t_tamb)
+vel = inca_interp(t_vel, vel, t_tamb)
+
+#%%---Loading calibrations
+cal_path = 'C:/Users/scosta1/OneDrive/OneDrive - JAGUAR LAND ROVER/Desktop/'
+cal_ExhMod_tDeltaExoHspCatHeatgB1_M = pd.read_excel(cal_path+'ExhMod_tDeltaExoHspCatHeatgB1_M.xlsx', sheet_name='Sheet1', index_col=0)
+cal_ExhMod_tDeltaExoHspCatHeatgB1_My_bkps = cal_ExhMod_tDeltaExoHspCatHeatgB1_M.index.to_list()
+cal_ExhMod_tDeltaExoHspCatHeatgB1_Mx_bkps = cal_ExhMod_tDeltaExoHspCatHeatgB1_M.columns[0:].to_list()
+
+cal_ExhMod_htcExhWallB1_M = pd.read_excel(cal_path+'ExhMod_htcExhWallB1_M.xlsx', sheet_name='Sheet1', index_col=0)
+cal_ExhMod_htcExhWallB1_My_bkps = cal_ExhMod_htcExhWallB1_M.iloc[0:,0].index.to_list()
+cal_ExhMod_htcExhWallB1_Mx_bkps = cal_ExhMod_htcExhWallB1_M.columns[0:].to_list()
+
+cal_ExhMod_cpAbsltPipCatB1_CA = pd.read_excel(cal_path+'ExhMod_cpAbsltPipCatB1_CA.xlsx', sheet_name='Sheet1', index_col=0)
+cal_ExhMod_cpAbsltPipCatB1_CAy_bkps = cal_ExhMod_cpAbsltPipCatB1_CA.iloc[0,0:].to_list()
+
+cal_ExhMod_htcWallEnvExtdB1_M = pd.read_excel(cal_path+'ExhMod_htcWallEnvExtdB1_M.xlsx', sheet_name='Sheet1', index_col=0)
+
+cal_ExhMod_stCfgExhSysB1_CA = pd.read_excel(cal_path+'ExhMod_stCfgExhSysB1_CA.xlsx', sheet_name='Sheet1')
+cal_ExhMod_stCfgExhSysB1_CAy_bkps = cal_ExhMod_stCfgExhSysB1_CA.iloc[0,1:].to_list()
+
+cal_ExhMod_ratPPolytropExpo_M = pd.read_excel(cal_path+'ExhMod_ratPPolytropExpo_M.xlsx', sheet_name='Sheet1', index_col=0)
+
+cal_ExhMod_facExoCorrnLamB1_M = pd.read_excel(cal_path+'ExhMod_facExoCorrnLamB1_M.xlsx', sheet_name='Sheet1', index_col=0)
+
+cal_ExhMod_tExhVlvHomB1_M = pd.read_excel(cal_path+'ExhMod_tExhVlvHomB1_M.xlsx', sheet_name='Sheet1', index_col=0)
+
+cal_ExhMod_facTExhVlvCorrnLamExtdB1_M = pd.read_excel(cal_path+'ExhMod_facTExhVlvCorrnLamExtdB1_M.xlsx', sheet_name='Sheet1', index_col=0)
+
+cal_ExhMod_facTExhVlvCorrnIgnAgHomExtdB1_M = pd.read_excel(cal_path+'ExhMod_facTExhVlvCorrnIgnAgHomExtdB1_M.xlsx', sheet_name='Sheet1', index_col=0)
+
+cal_ExhMod_cpAbsltVlvFildB1_C = 74.9753333333333390
+
+cal_ExhMod_tiConTExhVlvFcoB1_T = pd.read_excel(cal_path+'ExhMod_tiConTExhVlvFcoB1_T.xlsx', sheet_name='Sheet1', index_col=0)
+
+#%%---Loading Model Variables
+comp_j = 0
+comp_final = 4
+comp_tag = 0
+for comp_j in range(comp_j-1, comp_final):
+    if comp_j ==-1 and comp_tag==0:
+        comp_j+=1
+        comp_i = 0
+        comp_tag+=1
+    elif comp_j != -1 and comp_tag==0:
+        comp_i = comp_j + 1
+        comp_tag+=1
+    if comp_j>=0:
+        globals()['t_twall%s' %comp_j], globals()['twall%s' %comp_j] = get_vars(str('ExhMod_tWallAryB1_['+str(comp_j)+']'))
+        globals()['t_texh%s' %comp_j], globals()['texh%s' %comp_j] = get_vars(str('ExhMod_tExhAryB1_['+str(comp_j)+']'))
+    
+        globals()['real_texh%s' %comp_j] = globals()['texh%s' %comp_j].copy()
+        globals()['real_twall%s' %comp_j] = globals()['twall%s' %comp_j].copy()
+
+#%%---Calculation Looping
+poli_exp_f = 0
+f_lam = cal_func(cal_ExhMod_facExoCorrnLamB1_M, '2d')
+ff_vel = cal_func(cal_ExhMod_htcWallEnvExtdB1_M, '2d')
+for comp in cal_ExhMod_stCfgExhSysB1_CAy_bkps[comp_i:comp_final]: #Maximum component ID
+    
+    c_comp = cal_ExhMod_cpAbsltPipCatB1_CA.iloc[0,comp_i] #Constant for each element
+    # f_vel = ff_vel(0, comp_i) #Dyno conditions/if vehicle speed is different than 0, this equation must be different
+    if comp == 2: #catalyst
+        f_k = interpolate.interp1d(cal_ExhMod_tDeltaExoHspCatHeatgB1_Mx_bkps, 
+                                   cal_ExhMod_tDeltaExoHspCatHeatgB1_M.loc[comp_i,:], 
+                                   fill_value='extrapolate')
+    elif (comp == 1 or comp == 7):
+        f_k = interpolate.interp1d(cal_ExhMod_htcExhWallB1_Mx_bkps, cal_ExhMod_htcExhWallB1_M.loc[comp_i,:], fill_value='extrapolate')
+        if comp_i == 0:
+            f_ExhMod_tExhVlvHomB1_M = cal_func(cal_ExhMod_tExhVlvHomB1_M, '2d')
+            f_lam_vlv = cal_func(cal_ExhMod_facTExhVlvCorrnLamExtdB1_M, '2d')
+            f_ign_vlv = cal_func(cal_ExhMod_facTExhVlvCorrnIgnAgHomExtdB1_M, '2d')
+            exh_vlv_filter = cal_func(cal_ExhMod_tiConTExhVlvFcoB1_T, '1d')
+
+    if comp == 7:
+        poli_exp_f = cal_func(cal_ExhMod_ratPPolytropExpo_M, '2d')
+    for i in range(1, len(tamb)):
+        if comp_i!=0: #After Valve Gas Temp Calculation
+            globals()['twall%s' %comp_i][i], globals()['texh%s' %comp_i][i] = exhmod(
+                comp, f_k, globals()['texh%s' %comp_i], globals()['twall%s' %comp_i], 
+                i, ff_vel, c_comp, globals()['texh%s' %(comp_i-1)], poli_exp_f, f_lam)
+        else: #Valve Gas Temp Calculation
+            globals()['twall%s' %comp_i][i], globals()['texh%s' %comp_i][i] = exhvalve(i, f_ExhMod_tExhVlvHomB1_M, f_lam_vlv, f_ign_vlv, texh0, cal_ExhMod_cpAbsltVlvFildB1_C, twall0, f_k, c_comp, exh_vlv_filter, ff_vel)
+#%%---Plotting vars
+    y_v = 'texh'
+    t_var = globals()['t_'+y_v+'%s' %comp_i]
+    y_var = globals()[y_v+'%s' %comp_i]
+    y_real_var = globals()['real_'+y_v+'%s' %comp_i]
+    
+    plt.plot(t_var, y_var)
+    plt.plot(t_var, y_real_var)
+    plt.title(y_v+'_'+str(comp_i))
+    # plt.ylim(630,760)
+    plt.show()  
+
+    comp_i = comp_i + 1
+    
+    # plt.plot(t_tamb, texh2)
+    # plt.plot(t_tamb, cat_in_t)
+    
+# plt.plot(t_tamb, [(x+y)/2 for x, y in zip(texh8, texh9)])
+# plt.plot(t_tamb, gpf_in_t)
+#%%----Optimization
+
+erro = 10**6
+erro_1 = 10
+erro_global = 10
+count = 0        
+
+while erro>10:
+    
+    cal_ExhMod_tExhVlvHomB1_M, erro = optimization('cal_ExhMod_tExhVlvHomB1_M', [rpm, airmod, cat_in_t], 0, 3, 'texh2', [0,1100])
+    cal_ExhMod_facTExhVlvCorrnIgnAgHomExtdB1_M, erro = optimization('cal_ExhMod_facTExhVlvCorrnIgnAgHomExtdB1_M', [ignEff, mfExh, cat_in_t], 0, 3, 'texh2', [0.9, 1.4])
+    cal_ExhMod_facTExhVlvCorrnLamExtdB1_M, erro = optimization('cal_ExhMod_facTExhVlvCorrnLamExtdB1_M', [uego, mfExh, cat_in_t], 0, 3, 'texh2', [0.7, 1.1])
+    # cal_ExhMod_cpAbsltVlvFildB1_C , erro = optimization('cal_ExhMod_cpAbsltVlvFildB1_C', [uego, mfExh, cat_in_t], 0, 3, 'texh2', [20, 500])
+
+
+#     cal_ExhMod_htcWallEnvExtdB1_M, erro = optimization('cal_ExhMod_htcWallEnvExtdB1_M', [vel, len(vel)*[1], cat_in_t], 0, 3, 'texh2', [0, 1.5])
+#     cal_ExhMod_htcExhWallB1_M, erro = optimization('cal_ExhMod_htcExhWallB1_M', [mfExh, 1, cat_in_t], 0, 3, 'texh2', [0, 1])
+#     cal_ExhMod_ratPPolytropExpo_M, erro = optimization('cal_ExhMod_ratPPolytropExpo_M', [mfExh, ExhMod_ratPTcB1, cat_in_t], 0, 3, 'texh2', [0.8,1.05])    
